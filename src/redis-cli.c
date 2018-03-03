@@ -126,6 +126,9 @@ static struct pref {
     int hints;
 } pref;
 
+static redisReply *savedResults = NULL;
+static int saveResults = 0;
+
 static volatile sig_atomic_t force_cancel_loop = 0;
 static void usage(void);
 static void slaveMode(void);
@@ -750,6 +753,25 @@ sds sdsCatColorizedLdbReply(sds o, char *s, size_t len) {
     return sdscatcolor(o,s,len,color);
 }
 
+/* Sanity checking is done in the caller */
+static sds getResults(redisReply *r, size_t index) {
+    switch (r->type) {
+    case REDIS_REPLY_NIL:
+        return sdsempty();
+    case REDIS_REPLY_ERROR:
+    case REDIS_REPLY_STATUS:
+    case REDIS_REPLY_STRING:
+        return sdsnewlen(r->str, r->len);
+    case REDIS_REPLY_INTEGER:
+        return sdsfromlonglong(r->integer);
+    case REDIS_REPLY_ARRAY:
+        return getResults(r->element[index], 0);
+    default:
+        fprintf(stderr,"Unknown reply type: %d\n", r->type);
+        exit(1);
+    }
+}
+
 static sds cliFormatReplyRaw(redisReply *r) {
     sds out = sdsempty(), tmp;
     size_t i;
@@ -913,14 +935,79 @@ static int cliReadReply(int output_raw_strings) {
         fwrite(out,sdslen(out),1,stdout);
         sdsfree(out);
     }
-    freeReplyObject(reply);
+    if (saveResults) {
+        if (savedResults) {
+            freeReplyObject(savedResults);
+        }
+        savedResults = reply;
+        saveResults = 0;
+    } else {
+        freeReplyObject(reply);        
+    }
     return REDIS_OK;
 }
 
+static int expandSavedArgs(int argc, char **argv) {
+    int p;
+
+    for (p = 0; p < argc; p++) {
+        int count;
+        int skip_next = 0;
+        sds* split = sdssplitlen(argv[p], sdslen(argv[p]), "@", 1, &count);
+        if (count > 1) {
+            sds newarg = sdsdup(split[0]);
+            for (int i = 1; i < count; i++) {
+                if (skip_next) {
+                    newarg = sdscatsds(newarg, split[i]);
+                    skip_next = 0;
+                    continue;
+                }
+                if (sdslen(split[i]) == 0) {
+                    newarg = sdscat(newarg, "@");
+                    skip_next = 1;
+                } else {
+                    char *end;
+                    size_t index = strtoll(split[i], &end, 10);
+                    if (!savedResults || !index || (savedResults->type != REDIS_REPLY_ARRAY && index > 1) || (savedResults->type == REDIS_REPLY_ARRAY && index > savedResults->elements)) {
+                        if (index) {
+                            fprintf(stderr,"Error: No such index to expend: %zu\n", index);
+                        } else if (!savedResults) {
+                            fprintf(stderr,"Error: No saved results, use s to save them\n");
+                        } else {
+                            fprintf(stderr,"Error: Could not expand, no index given\n");
+                        }
+                        sdsfree(newarg);
+                        sdsfreesplitres(split, count);
+                        return 1;
+                    }
+                    newarg = sdscatsds(newarg, getResults(savedResults, index - 1));
+                    newarg = sdscat(newarg, end);
+                }
+            }
+            if (skip_next) {
+                fprintf(stderr,"Error: Could not expand, no index given\n");
+                sdsfree(newarg);
+                sdsfreesplitres(split, count);
+                return 1;
+            }
+            sdsfree(argv[p]);
+            argv[p] = newarg;
+        }
+        sdsfreesplitres(split, count);
+    }
+    return 0;
+}
+
 static int cliSendCommand(int argc, char **argv, int repeat) {
-    char *command = argv[0];
+    char *command;
     size_t *argvlen;
     int j, output_raw;
+
+    if (expandSavedArgs(argc, argv)) {
+        // ??
+        return REDIS_OK;
+    }
+    command = argv[0];
 
     if (!config.eval_ldb && /* In debugging mode, let's pass "help" to Redis. */
         (!strcasecmp(command,"help") || !strcasecmp(command,"?"))) {
@@ -1439,6 +1526,11 @@ static void repl(void) {
                         skipargs = 1;
                     } else {
                         repeat = 1;
+                    }
+
+                    if (argc > 1 && !strcasecmp(argv[0], "s")) {
+                        skipargs = 1;
+                        saveResults = 1;
                     }
 
                     issueCommandRepeat(argc-skipargs, argv+skipargs, repeat);
